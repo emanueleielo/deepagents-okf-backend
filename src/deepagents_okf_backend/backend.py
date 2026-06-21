@@ -6,7 +6,9 @@ searches work like a normal virtual filesystem; writes to ``.md`` documents are
 validated as OKF and (optionally) auto-stamped with a ``timestamp``.
 
 Every method returns a structured result with an ``error`` field and never raises —
-this is the ``BackendProtocol`` contract.
+this is the ``BackendProtocol`` contract. All disk IO is therefore guarded, and every
+path (including entries discovered by ``ls``/``glob``/``grep``) is confined to the
+bundle root, so a symlink inside the bundle cannot leak files from outside it.
 
 OKF spec: https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing
 """
@@ -14,6 +16,7 @@ OKF spec: https://cloud.google.com/blog/products/data-analytics/how-the-open-kno
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +45,11 @@ class _PathEscapeError(Exception):
     """Internal: agent attempted to access a path outside the bundle root."""
 
 
+def _iso(ts: float) -> str:
+    """Format a POSIX timestamp as a second-precision UTC ISO-8601 string."""
+    return datetime.fromtimestamp(ts, timezone.utc).replace(microsecond=0).isoformat()
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -53,8 +61,9 @@ class OKFBackend(BackendProtocol):
         root: Directory holding the OKF bundle. Created if it does not exist.
         validate: When True, writes/edits to ``.md`` docs must be valid OKF
             (``type`` field required) or the operation fails without touching disk.
-        auto_timestamp: When True, set/refresh the ``timestamp`` frontmatter field
-            on every ``.md`` write that carries frontmatter.
+        auto_timestamp: When True, ``write`` sets/refreshes the ``timestamp``
+            frontmatter field on ``.md`` docs that carry frontmatter. ``edit`` never
+            rewrites the frontmatter block, so a body-only edit is byte-preserving.
     """
 
     def __init__(
@@ -72,27 +81,62 @@ class OKFBackend(BackendProtocol):
     # ------------------------------------------------------------------ helpers
     def _resolve(self, path: str) -> Path:
         """Resolve an agent-supplied path inside the bundle root (no escaping)."""
-        candidate = (self.root / str(path).lstrip("/")).resolve()
-        if candidate != self.root and self.root not in candidate.parents:
+        raw = str(path)
+        if "\x00" in raw:
+            raise _PathEscapeError(path)
+        try:
+            candidate = (self.root / raw.lstrip("/")).resolve()
+        except (OSError, ValueError) as exc:  # malformed path, drive on Windows, etc.
+            raise _PathEscapeError(path) from exc
+        if not self._is_contained(candidate):
             raise _PathEscapeError(path)
         return candidate
+
+    def _is_contained(self, p: Path) -> bool:
+        """Whether ``p`` (after symlink resolution) stays within the bundle root."""
+        try:
+            resolved = p.resolve()
+        except OSError:
+            return False
+        return resolved == self.root or self.root in resolved.parents
 
     def _rel(self, p: Path) -> str:
         if p == self.root:
             return "/"
         return "/" + p.relative_to(self.root).as_posix()
 
-    def _file_info(self, p: Path) -> FileInfo:
-        stat = p.stat()
+    def _safe_file_info(self, p: Path) -> FileInfo | None:
+        """Build a FileInfo, or None if the entry vanished / cannot be stat'd."""
+        try:
+            stat = p.stat()
+        except OSError:
+            return None
         return FileInfo(
             path=self._rel(p),
             is_dir=p.is_dir(),
             size=stat.st_size,
-            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            modified_at=_iso(stat.st_mtime),
         )
 
-    def _prepare_write(self, file_path: str, content: str) -> tuple[str | None, str]:
-        """Apply OKF auto-timestamp + validation. Returns ``(error, content)``."""
+    def _contained_files(self, candidates: Iterable[Path]) -> list[Path]:
+        """Filter an iterable of paths to regular files that stay within root."""
+        out: list[Path] = []
+        for p in sorted(candidates):
+            if not self._is_contained(p):
+                continue
+            try:
+                if p.is_file():
+                    out.append(p)
+            except OSError:
+                continue
+        return out
+
+    def _stamp_and_validate(self, file_path: str, content: str) -> tuple[str | None, str]:
+        """For ``write``: optionally stamp ``timestamp``, then validate OKF.
+
+        Returns ``(error, content)``; ``content`` may be re-serialized to inject the
+        timestamp. This is acceptable on a full-content write but never used by ``edit``.
+        """
         if not is_okf_document(file_path):
             return None, content
         metadata, body = parse_frontmatter(content)
@@ -105,6 +149,16 @@ class OKFBackend(BackendProtocol):
                 return f"OKF validation failed for {file_path}: {'; '.join(errors)}", content
         return None, content
 
+    def _validate_only(self, file_path: str, content: str) -> str | None:
+        """For ``edit``: validate without mutating ``content``. Returns an error or None."""
+        if not is_okf_document(file_path) or not self.validate:
+            return None
+        metadata, _ = parse_frontmatter(content)
+        errors = validate_metadata(metadata)
+        if errors:
+            return f"edit would make {file_path} invalid OKF: {'; '.join(errors)}"
+        return None
+
     # ------------------------------------------------------------------- sync API
     def ls(self, path: str) -> LsResult:
         try:
@@ -115,7 +169,17 @@ class OKFBackend(BackendProtocol):
             return LsResult(error=f"no such path: {path}")
         if not target.is_dir():
             return LsResult(error=f"not a directory: {path}")
-        entries = [self._file_info(child) for child in sorted(target.iterdir())]
+        try:
+            children = sorted(target.iterdir())
+        except OSError as exc:
+            return LsResult(error=f"cannot list {path}: {exc}")
+        entries: list[FileInfo] = []
+        for child in children:
+            if not self._is_contained(child):
+                continue
+            info = self._safe_file_info(child)
+            if info is not None:
+                entries.append(info)
         return LsResult(entries=entries)
 
     def read(self, file_path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT) -> ReadResult:
@@ -125,14 +189,20 @@ class OKFBackend(BackendProtocol):
             return ReadResult(error=f"path escapes bundle root: {file_path}")
         if not target.is_file():
             return ReadResult(error=f"no such file: {file_path}")
-        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        if offset < 0 or limit < 0:
+            return ReadResult(error="offset and limit must be non-negative")
+        try:
+            stat = target.stat()
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return ReadResult(error=f"cannot read {file_path}: {exc}")
+        lines = text.splitlines(keepends=True)
         content = "".join(lines[offset : offset + limit])
-        stat = target.stat()
         file_data = FileData(
             content=content,
             encoding="utf-8",
-            created_at=datetime.fromtimestamp(stat.st_ctime, timezone.utc).isoformat(),
-            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            created_at=_iso(stat.st_ctime),
+            modified_at=_iso(stat.st_mtime),
         )
         return ReadResult(file_data=file_data)
 
@@ -141,11 +211,14 @@ class OKFBackend(BackendProtocol):
             target = self._resolve(file_path)
         except _PathEscapeError:
             return WriteResult(error=f"path escapes bundle root: {file_path}", path=None)
-        error, content = self._prepare_write(file_path, content)
+        error, content = self._stamp_and_validate(file_path, content)
         if error:
             return WriteResult(error=error, path=None)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return WriteResult(error=f"cannot write {file_path}: {exc}", path=None)
         return WriteResult(error=None, path=self._rel(target))
 
     def edit(
@@ -162,10 +235,11 @@ class OKFBackend(BackendProtocol):
                 error=f"path escapes bundle root: {file_path}", path=None, occurrences=None
             )
         if not target.is_file():
-            return EditResult(
-                error=f"no such file: {file_path}", path=None, occurrences=None
-            )
-        text = target.read_text(encoding="utf-8")
+            return EditResult(error=f"no such file: {file_path}", path=None, occurrences=None)
+        try:
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return EditResult(error=f"cannot read {file_path}: {exc}", path=None, occurrences=None)
         count = text.count(old_string)
         if count == 0:
             return EditResult(
@@ -175,10 +249,15 @@ class OKFBackend(BackendProtocol):
             new_text, occurrences = text.replace(old_string, new_string), count
         else:
             new_text, occurrences = text.replace(old_string, new_string, 1), 1
-        error, new_text = self._prepare_write(file_path, new_text)
+        # Validate the result without rewriting the frontmatter block: a body-only
+        # edit stays byte-for-byte what the agent asked for.
+        error = self._validate_only(file_path, new_text)
         if error:
             return EditResult(error=error, path=None, occurrences=None)
-        target.write_text(new_text, encoding="utf-8")
+        try:
+            target.write_text(new_text, encoding="utf-8")
+        except OSError as exc:
+            return EditResult(error=f"cannot write {file_path}: {exc}", path=None, occurrences=None)
         return EditResult(error=None, path=self._rel(target), occurrences=occurrences)
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
@@ -186,7 +265,11 @@ class OKFBackend(BackendProtocol):
             base = self._resolve(path) if path else self.root
         except _PathEscapeError:
             return GlobResult(error=f"path escapes bundle root: {path}")
-        matches = [self._file_info(p) for p in sorted(base.glob(pattern)) if p.is_file()]
+        matches: list[FileInfo] = []
+        for p in self._contained_files(base.glob(pattern)):
+            info = self._safe_file_info(p)
+            if info is not None:
+                matches.append(info)
         return GlobResult(matches=matches)
 
     def grep(
@@ -199,14 +282,13 @@ class OKFBackend(BackendProtocol):
             base = self._resolve(path) if path else self.root
         except _PathEscapeError:
             return GrepResult(error=f"path escapes bundle root: {path}")
-        candidates = base.glob(glob) if glob else base.rglob("*")
+        # grep is always recursive; the optional `glob` only filters file names.
+        candidates = base.rglob(glob) if glob else base.rglob("*")
         matches: list[GrepMatch] = []
-        for p in sorted(candidates):
-            if not p.is_file():
-                continue
+        for p in self._contained_files(candidates):
             try:
                 text = p.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
+            except (OSError, UnicodeDecodeError):
                 continue
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if pattern in line:
@@ -224,8 +306,12 @@ class OKFBackend(BackendProtocol):
             except _PathEscapeError:
                 responses.append(FileUploadResponse(path=file_path, error="permission_denied"))
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            except OSError as exc:
+                responses.append(FileUploadResponse(path=file_path, error=str(exc)))
+                continue
             responses.append(FileUploadResponse(path=self._rel(target), error=None))
         return responses
 
@@ -244,11 +330,12 @@ class OKFBackend(BackendProtocol):
                     FileDownloadResponse(path=file_path, content=None, error="file_not_found")
                 )
                 continue
-            responses.append(
-                FileDownloadResponse(
-                    path=self._rel(target), content=target.read_bytes(), error=None
-                )
-            )
+            try:
+                data = target.read_bytes()
+            except OSError as exc:
+                responses.append(FileDownloadResponse(path=file_path, content=None, error=str(exc)))
+                continue
+            responses.append(FileDownloadResponse(path=self._rel(target), content=data, error=None))
         return responses
 
     # ------------------------------------------------------------------ async API

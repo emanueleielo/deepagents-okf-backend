@@ -57,7 +57,10 @@ def query_bundle(
         if type is not None and (doc_type or "").lower() != type.lower():
             continue
 
-        doc_tags = metadata.get("tags") or []
+        raw_tags = metadata.get("tags") or []
+        # A malformed bundle may store `tags` as a bare string; normalize to a list
+        # so we never iterate it character-by-character.
+        doc_tags = raw_tags if isinstance(raw_tags, list) else [raw_tags]
         if wanted_tags and not wanted_tags.issubset({str(t).lower() for t in doc_tags}):
             continue
 

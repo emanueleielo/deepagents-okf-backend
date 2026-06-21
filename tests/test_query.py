@@ -36,6 +36,13 @@ def test_query_no_filters_returns_all(backend: OKFBackend) -> None:
     assert len(query_bundle(backend)) == 2
 
 
+def test_query_string_tags_do_not_match_per_character(tmp_path: Path) -> None:
+    be = OKFBackend(tmp_path, validate=False, auto_timestamp=False)
+    be.write("/d.md", "---\ntype: X\ntags: prod\n---\nbody\n")  # tags is a bare string
+    assert [h.path for h in query_bundle(be, tags=["prod"])] == ["/d.md"]
+    assert query_bundle(be, tags=["p"]) == []  # must NOT match a single character
+
+
 def test_query_tool_returns_readable_text(backend: OKFBackend) -> None:
     okf_query = make_okf_query_tool(backend)
     out = okf_query.invoke({"type": "Metric"})
