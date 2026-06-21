@@ -120,7 +120,7 @@ tags: [sales, revenue]
 
 ## Development
 
-See [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md). Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ```bash
 pip install -e ".[dev]"
