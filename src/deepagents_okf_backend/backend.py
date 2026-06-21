@@ -21,7 +21,9 @@ from deepagents.backends.protocol import (
     BackendProtocol,
     EditResult,
     FileData,
+    FileDownloadResponse,
     FileInfo,
+    FileUploadResponse,
     GlobResult,
     GrepMatch,
     GrepResult,
@@ -129,6 +131,7 @@ class OKFBackend(BackendProtocol):
         file_data = FileData(
             content=content,
             encoding="utf-8",
+            created_at=datetime.fromtimestamp(stat.st_ctime, timezone.utc).isoformat(),
             modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
         )
         return ReadResult(file_data=file_data)
@@ -155,13 +158,19 @@ class OKFBackend(BackendProtocol):
         try:
             target = self._resolve(file_path)
         except _PathEscapeError:
-            return EditResult(error=f"path escapes bundle root: {file_path}", path=None, occurrences=None)
+            return EditResult(
+                error=f"path escapes bundle root: {file_path}", path=None, occurrences=None
+            )
         if not target.is_file():
-            return EditResult(error=f"no such file: {file_path}", path=None, occurrences=None)
+            return EditResult(
+                error=f"no such file: {file_path}", path=None, occurrences=None
+            )
         text = target.read_text(encoding="utf-8")
         count = text.count(old_string)
         if count == 0:
-            return EditResult(error=f"old_string not found in {file_path}", path=None, occurrences=0)
+            return EditResult(
+                error=f"old_string not found in {file_path}", path=None, occurrences=0
+            )
         if replace_all:
             new_text, occurrences = text.replace(old_string, new_string), count
         else:
@@ -204,6 +213,44 @@ class OKFBackend(BackendProtocol):
                     matches.append(GrepMatch(path=self._rel(p), line=lineno, text=line))
         return GrepResult(matches=matches)
 
+    # ----------------------------------------------------------------- binary IO
+    # Raw byte transfer for non-markdown artifacts (images, exports, attachments).
+    # OKF validation is intentionally skipped here — these are opaque blobs.
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        responses: list[FileUploadResponse] = []
+        for file_path, data in files:
+            try:
+                target = self._resolve(file_path)
+            except _PathEscapeError:
+                responses.append(FileUploadResponse(path=file_path, error="permission_denied"))
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            responses.append(FileUploadResponse(path=self._rel(target), error=None))
+        return responses
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        responses: list[FileDownloadResponse] = []
+        for file_path in paths:
+            try:
+                target = self._resolve(file_path)
+            except _PathEscapeError:
+                responses.append(
+                    FileDownloadResponse(path=file_path, content=None, error="permission_denied")
+                )
+                continue
+            if not target.is_file():
+                responses.append(
+                    FileDownloadResponse(path=file_path, content=None, error="file_not_found")
+                )
+                continue
+            responses.append(
+                FileDownloadResponse(
+                    path=self._rel(target), content=target.read_bytes(), error=None
+                )
+            )
+        return responses
+
     # ------------------------------------------------------------------ async API
     # Local filesystem IO is blocking; offload to a worker thread so async agents
     # never block the event loop.
@@ -234,3 +281,9 @@ class OKFBackend(BackendProtocol):
         self, pattern: str, path: str | None = None, glob: str | None = None
     ) -> GrepResult:
         return await asyncio.to_thread(self.grep, pattern, path, glob)
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        return await asyncio.to_thread(self.upload_files, files)
+
+    async def adownload_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        return await asyncio.to_thread(self.download_files, paths)

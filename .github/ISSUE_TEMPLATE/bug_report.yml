@@ -1,0 +1,26 @@
+name: Bug report
+description: Report a problem with deepagents-okf-backend
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Smallest code snippet that reproduces the issue.
+      render: python
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `pip show deepagents-okf-backend deepagents | grep Version` and your Python version.
+    validations:
+      required: true

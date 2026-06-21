@@ -26,4 +26,4 @@ jobs:
       - name: Type check
         run: mypy src
       - name: Test
-        run: pytest -q
+        run: pytest -q --cov=deepagents_okf_backend --cov-report=term-missing --cov-fail-under=85
