@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from deepagents.backends.protocol import (
@@ -47,11 +47,11 @@ class _PathEscapeError(Exception):
 
 def _iso(ts: float) -> str:
     """Format a POSIX timestamp as a second-precision UTC ISO-8601 string."""
-    return datetime.fromtimestamp(ts, timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.fromtimestamp(ts, UTC).replace(microsecond=0).isoformat()
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 class OKFBackend(BackendProtocol):
