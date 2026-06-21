@@ -19,3 +19,7 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Internal working docs — kept local, not published
+/DEVELOPMENT_PLAN.md
+/CHANGELOG.md

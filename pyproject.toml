@@ -36,6 +36,10 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
 ]
+examples = [
+    "langchain-anthropic>=0.3",
+    "python-dotenv>=1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/emanueleielo/deepagents-okf-backend"
